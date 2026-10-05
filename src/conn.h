@@ -105,6 +105,7 @@ typedef struct {
 	char *local_if;
 
 	bool state;
+	bool recoverable;
 	pthread_t setup_thread[1];
 	pthread_mutex_t lock;
 } conn_t;

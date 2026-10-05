@@ -55,6 +55,7 @@
 
 typedef struct {
 	int fd;
+    int last_error;
 	sa_family_t ai_family;
 #ifdef HAVE_SSL
 	SSL *ssl;

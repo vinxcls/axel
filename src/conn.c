@@ -51,6 +51,60 @@
 #include "hash.h"
 #include "http.h"
 
+/*
+ * Reply code classification.
+ *
+ * HTTP (RFC 9110):          FTP (RFC 959):
+ *   1xx  informational       1xx  positive preliminary
+ *   2xx  success             2xx  positive completion
+ *   3xx  redirect            3xx  positive intermediate
+ *   4xx  client error        4xx  transient negative   -> recoverable
+ *   5xx  server error        5xx  permanent negative   -> not recoverable
+ *
+ * For HTTP, 4xx is permanent except 408 (Request Timeout) and
+ * 429 (Too Many Requests), which are transient by definition.
+ * 5xx is treated as transient: the server may recover.
+ *
+ * So the two protocols disagree on 4xx and 5xx, which is exactly
+ * why the classification has to know the protocol.
+ */
+
+/* TCP/DNS errors, from tcp->last_error (an errno). */
+static
+bool
+tcp_error_is_recoverable(const tcp_t *tcp)
+{
+	/* Bitmask for recoverable errno values.
+	 * Works because EAGAIN(11), EINTR(4), ENOMEM(12), EBUSY(16) are all < 64. */
+	uint64_t mask = (1ULL << EAGAIN) | (1ULL << EINTR) |
+	                (1ULL << ENOMEM) | (1ULL << EBUSY);
+	return (mask >> tcp->last_error) & 1;
+}
+
+/* FTP errors.  Prefer the server's reply code; fall back to the
+ * underlying TCP/DNS error if the server never answered. */
+static
+bool
+ftp_error_is_recoverable(const ftp_t *ftp)
+{
+	if (ftp->status)
+		return ftp->status / 100 == 4;
+	return tcp_error_is_recoverable(&ftp->tcp);
+}
+
+/* Reply code classification, per the table at the top of this file. */
+static
+bool
+conn_status_recoverable(int proto, int code)
+{
+	bool is_ftp = PROTO_IS_FTP(proto);
+	bool is_4xx = (unsigned)(code - 400) < 100;
+	bool is_exc = (code == 408) | (code == 429);
+	bool ftp_result = is_4xx;
+	bool http_result = !is_4xx | is_exc;
+	return (is_ftp & ftp_result) | (!is_ftp & http_result);
+}
+
 /**
  * Convert an URL to a conn_t structure.
  */
@@ -233,6 +287,8 @@ conn_init(conn_t *conn)
 	char *proxy = conn->conf->http_proxy, *host = conn->conf->no_proxy;
 	int i;
 
+	conn->recoverable = false;
+
 	if (*conn->conf->http_proxy == 0) {
 		proxy = NULL;
 	} else if (*conn->conf->no_proxy != 0) {
@@ -256,11 +312,13 @@ conn_init(conn_t *conn)
 				 conn->user, conn->pass,
 				 conn->conf->io_timeout)) {
 			conn->message = conn->ftp->message;
+			conn->recoverable = ftp_error_is_recoverable(conn->ftp);
 			conn_disconnect(conn);
 			return 0;
 		}
 		conn->message = conn->ftp->message;
 		if (!ftp_cwd(conn->ftp, conn->dir)) {
+			conn->recoverable = ftp_error_is_recoverable(conn->ftp);
 			conn_disconnect(conn);
 			return 0;
 		}
@@ -271,6 +329,8 @@ conn_init(conn_t *conn)
 				  conn->port, conn->user, conn->pass,
 				  conn->conf->io_timeout)) {
 			conn->message = conn->http->headers->p;
+			conn->recoverable =
+				tcp_error_is_recoverable(&conn->http->tcp);
 			conn_disconnect(conn);
 			return 0;
 		}
@@ -294,16 +354,21 @@ conn_setup(conn_t *conn)
 
 	if (PROTO_IS_FTP(conn->proto) && !conn->proxy) {
 		/* Set up data connection */
-		if (!ftp_data(conn->ftp, conn->conf->io_timeout))
+		if (!ftp_data(conn->ftp, conn->conf->io_timeout)) {
+			conn->recoverable = ftp_error_is_recoverable(conn->ftp);
 			return 0;
+		}
 		conn->tcp = &conn->ftp->data_tcp;
 
 		if (conn->currentbyte) {
 			ftp_command(conn->ftp, "REST %jd",
 				    (intmax_t)conn->currentbyte);
 			if (ftp_wait(conn->ftp) / 100 != 3 &&
-			    conn->ftp->status / 100 != 2)
+			    conn->ftp->status / 100 != 2) {
+				conn->recoverable =
+					ftp_error_is_recoverable(conn->ftp);
 				return 0;
+			}
 		}
 	} else {
 		char s[MAX_STRING * 2];
@@ -358,17 +423,21 @@ conn_info_ftp(conn_t *conn)
 		conn->supported = false;
 	}
 
-	if (!ftp_cwd(conn->ftp, conn->dir))
+	if (!ftp_cwd(conn->ftp, conn->dir)) {
+		conn->recoverable = ftp_error_is_recoverable(conn->ftp);
 		return 0;
+	}
 	conn->size = ftp_size(conn->ftp, conn->file,
 			      conn->conf->max_redirect,
 			      conn->conf->io_timeout);
 	if (conn->size < 0)
 		conn->supported = false;
-	if (conn->size == -1)
+	if (conn->size == -1) {
+		conn->recoverable = ftp_error_is_recoverable(conn->ftp);
 		return 0;
-	else if (conn->size == -2)
+	} else if (conn->size == -2) {
 		conn->size = LLONG_MAX;
+	}
 
 	return 1;
 }
@@ -464,6 +533,7 @@ conn_info(conn_t *conn)
 {
 	/* A redirect or a previous protocol must not leave its filename here */
 	conn->output_filename[0] = '\0';
+	conn->recoverable = false;
 
 	/* It's all a bit messed up.. But it works. */
 	if (PROTO_IS_FTP(conn->proto) && !conn->proxy) {
@@ -484,15 +554,17 @@ conn_info(conn_t *conn)
 		int setup_ret = conn_setup(conn);
 		pthread_mutex_unlock(&conn->lock);
 		if (!setup_ret)
-			return 0;
+			return 0;   /* recoverable already set by conn_init/conn_setup */
 		conn_exec(conn);
 		conn_disconnect(conn);
 
 		/* Code 3xx == redirect */
 		if (conn->http->status / 100 != 3)
 			break;
-		if ((t = http_header(conn->http, "location:")) == NULL)
+		if ((t = http_header(conn->http, "location:")) == NULL) {
+			conn->recoverable = false;
 			return 0;
+		}
 		sscanf(t, "%1000s", s);
 		if (s[0] == '/') {
 			abuf_printf(conn->http->headers, "%s%s:%i%s",
@@ -508,8 +580,10 @@ conn_info(conn_t *conn)
 			strlcpy(s, conn->http->headers->p, sizeof(s));
 		}
 
-		if (!conn_redirect(conn, s))
+		if (!conn_redirect(conn, s)) {
+			conn->recoverable = false;
 			return 0;
+		}
 
 		/* check if the download has been redirected to FTP and
 		 * report it back to the caller */
@@ -519,12 +593,14 @@ conn_info(conn_t *conn)
 
 		if (++i >= conn->conf->max_redirect) {
 			fprintf(stderr, _("Too many redirects.\n"));
+			conn->recoverable = false;
 			return 0;
 		}
 
 		/* Check if the current URL has already been visited */
 		if (urlseq_check_loop(urlseq, conn)) {
 			fprintf(stderr, _("Redirect loop detected.\n"));
+			conn->recoverable = false;
 			return 0;
 		}
 	} while (conn->http->status / 100 == 3);
@@ -533,8 +609,11 @@ conn_info(conn_t *conn)
 	urlseq_teardown(&urlseq);
 
 	/* Check for non-recoverable errors */
-	if (conn->http->status != 416 && conn->http->status / 100 != 2)
+	if (conn->http->status != 416 && conn->http->status / 100 != 2) {
+		conn->recoverable = conn_status_recoverable(conn->proto,
+							    conn->http->status);
 		return 0;
+	}
 
 	http_filename(conn->http, conn->output_filename,
 		      sizeof(conn->output_filename));
@@ -554,6 +633,7 @@ conn_info(conn_t *conn)
 		case 206: /* Partial Content */
 			break;
 		default: /* unexpected */
+			conn->recoverable = false;
 			return 0;
 		}
 	}
@@ -569,7 +649,7 @@ conn_info(conn_t *conn)
 }
 
 /**
- * Parse HTTP response status code, e.g. "HTTP/1.1 200 OK".
+ * Parse HTTP/FTP response status code and human-readable message.
  */
 int
 conn_info_status_get(char *msg, size_t size, conn_t *conn)
@@ -581,6 +661,12 @@ conn_info_status_get(char *msg, size_t size, conn_t *conn)
 			/* Copy human-readable status only */
 			strlcpy(msg, p + 13, min(len - 12, size));
 			return conn->http->status;
+		}
+	} else {
+		const char *ftpmsg = conn->ftp->message;
+		if (ftpmsg && *ftpmsg) {
+			strlcpy(msg, ftpmsg, size);
+			return conn->ftp->status;
 		}
 	}
 	strlcpy(msg, _("Unknown Error"), size);

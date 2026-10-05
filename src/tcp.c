@@ -77,6 +77,18 @@ tcp_error(char *hostname, int port, const char *reason)
 		hostname, port, reason);
 }
 
+/* Map a getaddrinfo() failure code onto a canonical errno */
+static
+int
+eai_to_errno(int eai)
+{
+	if (eai == EAI_AGAIN)
+		return EAGAIN;
+	if (eai == EAI_SYSTEM)
+		return errno ? errno : EIO;
+	return ENOENT;
+}
+
 /* Get a TCP connection */
 int
 tcp_connect(tcp_t *tcp, char *hostname, int port, int secure, char *local_if,
@@ -88,6 +100,9 @@ tcp_connect(tcp_t *tcp, char *hostname, int port, int secure, char *local_if,
 	struct addrinfo *gai_results, *gai_result;
 	int ret;
 	int sock_fd = -1;
+
+	/* Forget whatever the previous attempt left behind. */
+	tcp->last_error = 0;
 
 	memset(&local_addr, 0, sizeof(local_addr));
 	if (local_if) {
@@ -110,6 +125,7 @@ tcp_connect(tcp_t *tcp, char *hostname, int port, int secure, char *local_if,
 
 	ret = getaddrinfo(hostname, portstr, &ai_hints, &gai_results);
 	if (ret != 0) {
+		tcp->last_error = eai_to_errno(ret);
 		tcp_error(hostname, port, gai_strerror(ret));
 		return -1;
 	}
@@ -125,8 +141,10 @@ tcp_connect(tcp_t *tcp, char *hostname, int port, int secure, char *local_if,
 		sock_fd = socket(gai_result->ai_family,
 				 gai_result->ai_socktype,
 				 gai_result->ai_protocol);
-		if (sock_fd == -1)
+		if (sock_fd == -1) {
+			tcp->last_error = errno;
 			continue;
+		}
 
 		if (local_if && gai_result->ai_family == AF_INET) {
 			bind(sock_fd, (struct sockaddr *)&local_addr,
@@ -149,8 +167,10 @@ tcp_connect(tcp_t *tcp, char *hostname, int port, int secure, char *local_if,
 		if (ret != -1)
 			break;
 
-		if (errno != EINPROGRESS)
+		if (errno != EINPROGRESS) {
+			tcp->last_error = errno;
 			continue;
+		}
 
 		/* With TFO we must assume success */
 		if (tcp_fastopen != -1)
@@ -165,12 +185,15 @@ tcp_connect(tcp_t *tcp, char *hostname, int port, int secure, char *local_if,
 		/* Success? */
 		if (ret != -1)
 			break;
+		tcp->last_error = errno;
 	} while ((gai_result = gai_result->ai_next));
 
 	freeaddrinfo(gai_results);
 
 	if (sock_fd == -1) {
-		tcp_error(hostname, port, strerror(errno));
+		if (!tcp->last_error)
+			tcp->last_error = errno ? errno : ENETUNREACH;
+		tcp_error(hostname, port, strerror(tcp->last_error));
 		return -1;
 	}
 
@@ -180,6 +203,8 @@ tcp_connect(tcp_t *tcp, char *hostname, int port, int secure, char *local_if,
 	if (secure) {
 		tcp->ssl = ssl_connect(sock_fd, hostname);
 		if (tcp->ssl == NULL) {
+			if (tcp->last_error == 0)
+				tcp->last_error = errno ? errno : EPROTO;
 			close(sock_fd);
 			return -1;
 		}

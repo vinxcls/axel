@@ -61,7 +61,6 @@ static char *buffer = NULL;
 
 #define MIN_CHUNK_WORTH (100 * 1024) /* 100 KB */
 
-
 /* Create a new axel_t structure */
 axel_t *
 axel_new(conf_t *conf, int count, const search_t *res)
@@ -127,7 +126,6 @@ axel_new(conf_t *conf, int count, const search_t *res)
 	}
 
 	axel->conn[0].local_if = axel->conf->interfaces->text;
-	axel->conf->interfaces = axel->conf->interfaces->next;
 
 	strlcpy(axel->filename, axel->conn[0].file, sizeof(axel->filename));
 	http_decode(axel->filename);
@@ -153,20 +151,23 @@ axel_new(conf_t *conf, int count, const search_t *res)
 	}
 
 	do {
-		if (!conn_init(&axel->conn[0])) {
-			axel_message(axel, "%s", axel->conn[0].message);
+		conn_t *conn = &axel->conn[0];
+		if (!conn_init(conn)) {
+			axel_message(axel, "%s", conn->message);
 			axel->ready = -1;
+			axel->recoverable = conn->recoverable;
 			return axel;
 		}
 
 		/* This does more than just checking the file size, it all
 		 * depends on the protocol used. */
-		status = conn_info(&axel->conn[0]);
+		status = conn_info(conn);
 		if (!status) {
 			char msg[80];
 			int code = conn_info_status_get(msg, sizeof(msg), axel->conn);
 			fprintf(stderr, _("ERROR %d: %s.\n"), code, msg);
 			axel->ready = -1;
+			axel->recoverable = conn->recoverable;
 			return axel;
 		}
 	} while (status == -1); /* re-init in case of protocol change. This can
@@ -198,8 +199,18 @@ axel_new(conf_t *conf, int count, const search_t *res)
 
 	return axel;
  nomem:
-	axel_close(axel);
 	printf("%s\n", strerror(errno));
+	if (buffer) {
+		free(buffer);
+		buffer = NULL;
+	}
+	if (axel) {
+		if (axel->url)
+			free(axel->url);
+		if (axel->conn)
+			free(axel->conn);
+		free(axel);
+	}
 	return NULL;
 }
 
@@ -359,16 +370,18 @@ axel_start(axel_t *axel)
 {
 	int i;
 	url_t *url_ptr;
+	axel_if_t *iface;
 
 	/* HTTP might've redirected and FTP handles wildcards, so
 	   re-scan the URL for every conn */
 	url_ptr = axel->url;
+	iface = axel->conf->interfaces;
 	for (i = 0; i < axel->conf->num_connections; i++) {
 		axel->conn[i].conf = axel->conf;
 		conn_set(&axel->conn[i], url_ptr->text);
 		url_ptr = url_ptr->next;
-		axel->conn[i].local_if = axel->conf->interfaces->text;
-		axel->conf->interfaces = axel->conf->interfaces->next;
+		axel->conn[i].local_if = iface->text;
+		iface = iface->next;
 		if (i)
 			axel->conn[i].supported = true;
 	}
@@ -449,11 +462,12 @@ read_connection(axel_t *axel, int i, fd_set *fds)
 	}
 
 	if (size == 0) {
+		bool incomplete = axel->conn[i].currentbyte < axel->conn[i].lastbyte &&
+				  axel->size != LLONG_MAX;
+
 		if (axel->conf->verbose) {
 			/* Only abnormal behaviour if: */
-			if (axel->conn[i].currentbyte <
-			    axel->conn[i].lastbyte &&
-			    axel->size != LLONG_MAX) {
+			if (incomplete) {
 				axel_message(axel,
 					     _("Connection %i unexpectedly closed"),
 					     i);
@@ -464,7 +478,8 @@ read_connection(axel_t *axel, int i, fd_set *fds)
 			}
 		}
 		if (!axel->conn[0].supported) {
-			axel->ready = 1;
+			axel->ready = incomplete ? -1 : 1;
+			axel->recoverable |= incomplete;
 		}
 		conn_disconnect(&axel->conn[i]);
 		reactivate_connection(axel, i);
@@ -520,12 +535,20 @@ static
 void
 restart_connections(axel_t *axel)
 {
+	bool any_alive = false;
 	url_t *url_ptr = axel->url;
 
 	for (int i = 0; i < axel->conf->num_connections; i++) {
 		/* skip connection if setup thread hasn't released the lock yet */
-		if (pthread_mutex_trylock(&axel->conn[i].lock))
+		if (pthread_mutex_trylock(&axel->conn[i].lock)) {
+			/* A connection we cannot lock is being worked on, not dead */
+			any_alive = true;
 			continue;
+		}
+
+		if (axel->conn[i].enabled ||
+		    axel->conn[i].currentbyte < axel->conn[i].lastbyte)
+			any_alive = true;
 
 		if (!axel->conn[i].enabled &&
 		    axel->conn[i].currentbyte < axel->conn[i].lastbyte) {
@@ -564,6 +587,11 @@ restart_connections(axel_t *axel)
 			}
 		}
 		pthread_mutex_unlock(&axel->conn[i].lock);
+	}
+
+	if (!any_alive && !axel->ready) {
+		axel->ready = -1;
+		axel->recoverable = true;
 	}
 }
 
